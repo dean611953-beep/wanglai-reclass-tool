@@ -98,9 +98,26 @@ IGNORED_FILENAME_MARKERS = ["~$", "结果", "规则", "模板", "记忆"]
 
 RULES_HEADER = ["总账科目：长文本", "公司代码货币价值", "余额方向", "重分类科目"]
 
-# 规则永久记忆：在数据源目录固定保存一份“当前生效规则”副本 + 元信息记录
+# 规则永久记忆：在软件自身固定存储目录保存“当前生效规则”副本 + 元信息记录，
+# 不依赖数据源目录（数据源目录中出现任何规则文件均不影响当前生效规则）。
 MEMORY_RULES_FILENAME = "当前生效重分类规则.xlsx"
 MEMORY_META_FILENAME = "重分类规则记忆.json"
+
+
+def get_memory_dir():
+    """软件自身固定存储目录（跨平台）：
+       macOS: ~/Library/Application Support/往来重分类分析工具/
+       Windows: %APPDATA%/往来重分类分析工具/
+    不依赖数据源目录，规则导入后固化于此，不重新导入规则保持不变。"""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.path.expanduser("~/.config")
+    d = os.path.join(base, "往来重分类分析工具")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +218,9 @@ def resolve_source_paths(data_dir, explicit_files=None):
 
     优先级：
       1) 显式指定文件（explicit_files：dict {标准文件名/类型: 路径} 或 路径列表）——
-         按内容分类归入对应类型；
+         按内容分类归入对应类型；dict 的 key 若已是 SOURCE_TYPES 类型名（如
+         "balance"/"estimate"/"customer"），视为调用方（GUI 列表加载时）已缓存的
+         分类结果，直接复用、不再读表头；
       2) 目录内扫描识别（列结构 + 文件名关键词），同类型多候选时标准文件名优先；
       3) 均未找到 -> 该类型为 None（调用方据此报错）。
 
@@ -212,6 +231,10 @@ def resolve_source_paths(data_dir, explicit_files=None):
         if isinstance(explicit_files, dict):
             for key, p in explicit_files.items():
                 if not p or not os.path.isfile(p):
+                    continue
+                if key in SOURCE_TYPES:
+                    # 已分类结果（GUI 列表加载时缓存）：直接复用，不再读表头
+                    explicit[key] = p
                     continue
                 cls = classify_source_file(p)
                 if cls:
@@ -394,14 +417,13 @@ def _file_md5(path):
     return h.hexdigest()
 
 
-def persist_rule_memory(data_dir, source_rules_path):
-    """将本次导入/生效的重分类规则持久化保存到数据源目录固定位置：
-       <data_dir>/当前生效重分类规则.xlsx（覆盖旧副本）+ <data_dir>/重分类规则记忆.json。
+def persist_rule_memory(source_rules_path, rule_count=None):
+    """将本次导入/生效的重分类规则固化保存到软件自身固定存储目录：
+       <软件存储目录>/当前生效重分类规则.xlsx（覆盖旧副本）+ 重分类规则记忆.json。
     返回 (副本路径, 元信息 dict)；写入失败时返回 (None, None)。"""
     try:
-        if not os.path.isdir(data_dir):
-            return None, None
-        dst = os.path.join(data_dir, MEMORY_RULES_FILENAME)
+        mem_dir = get_memory_dir()
+        dst = os.path.join(mem_dir, MEMORY_RULES_FILENAME)
         # 源与目标为同一物理文件时跳过复制，仅刷新记忆记录
         try:
             same = os.path.realpath(source_rules_path) == os.path.realpath(dst)
@@ -409,13 +431,21 @@ def persist_rule_memory(data_dir, source_rules_path):
             same = False
         if not same:
             shutil.copy2(source_rules_path, dst)
+        # 确保副本可写：源规则文件若为只读（copy2 保留只读属性），
+        # 后续导入新规则覆盖副本会 Permission denied，导致记忆静默失效。
+        try:
+            os.chmod(dst, 0o644)
+        except Exception:
+            pass
         meta = {
             "rules_path": dst,
             "source_path": os.path.abspath(source_rules_path),
             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "md5": _file_md5(dst),
         }
-        meta_path = os.path.join(data_dir, MEMORY_META_FILENAME)
+        if rule_count is not None:
+            meta["count"] = int(rule_count)
+        meta_path = os.path.join(mem_dir, MEMORY_META_FILENAME)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         return dst, meta
@@ -424,10 +454,11 @@ def persist_rule_memory(data_dir, source_rules_path):
         return None, None
 
 
-def load_rule_memory(data_dir):
-    """读取数据源目录下的规则记忆元信息，返回 dict 或 None。"""
+def load_rule_memory():
+    """读取软件自身存储目录下的规则记忆元信息，返回 dict 或 None。"""
     try:
-        meta_path = os.path.join(data_dir, MEMORY_META_FILENAME)
+        mem_dir = get_memory_dir()
+        meta_path = os.path.join(mem_dir, MEMORY_META_FILENAME)
         if not os.path.isfile(meta_path):
             return None
         with open(meta_path, "r", encoding="utf-8") as f:
@@ -437,32 +468,20 @@ def load_rule_memory(data_dir):
         return None
 
 
-def resolve_rules_path(data_dir, explicit_rules=""):
-    """确定本次分析使用的规则文件路径（自动加载优先顺序）：
-       1) 显式指定规则文件（--rules / GUI 选择） -> 直接使用，并覆盖记忆；
-       2) 记忆副本（当前生效重分类规则.xlsx + 记忆记录） -> 自动加载；
-       3) 数据源目录下 当前生效重分类规则.xlsx（无记录时兜底）；
-       4) 数据源目录下 重分类规则.xlsx（首次使用兜底）。
-    返回 (path, auto_loaded, meta)：
-       - explicit_rules 命中时 auto_loaded=False, meta=None（调用方会持久化覆盖记忆）
-       - 记忆命中时 auto_loaded=True, meta=记忆元信息
-       - 找不到任何规则时返回 (None, False, None)"""
+def resolve_rules_path(explicit_rules=""):
+    """确定本次分析使用的规则文件路径（来源优先级）：
+       1) 显式指定规则文件（--rules / GUI 选择） -> 直接使用，并覆盖更新软件自身记忆；
+       2) 软件自身记忆中的规则（当前生效重分类规则.xlsx 副本 + 记忆记录） -> 自动加载；
+       3) 无显式指定且无记忆 -> 返回 (None, False, None)，提示先导入规则。
+     不再扫描数据源目录：数据源目录中任何规则文件均不影响当前生效规则。"""
     if explicit_rules:
         return explicit_rules, False, None
-    # 1) 记忆记录指向的副本
-    meta = load_rule_memory(data_dir)
+    # 2) 软件自身记忆
+    meta = load_rule_memory()
     if meta:
         mem_path = meta.get("rules_path") or ""
         if mem_path and os.path.isfile(mem_path):
             return mem_path, True, meta
-    # 2) 固定副本（无记录但文件存在）
-    fixed = os.path.join(data_dir, MEMORY_RULES_FILENAME)
-    if os.path.isfile(fixed):
-        return fixed, True, None
-    # 3) 默认规则文件
-    default_rules = os.path.join(data_dir, "重分类规则.xlsx")
-    if os.path.isfile(default_rules):
-        return default_rules, False, None
     return None, False, None
 
 
@@ -666,13 +685,13 @@ def run_analysis(data_dir, rules_path, out_path, source_files=None):
     rules = load_rules(rules_path)
     print(f"      已加载 {len(rules)} 条规则")
 
-    print("[记忆] 将本次生效规则持久化保存（下次运行自动加载最新规则）...")
-    mem_dst, _ = persist_rule_memory(data_dir, rules_path)
+    print("[记忆] 将本次生效规则固化保存到软件自身存储目录（下次运行自动加载最新规则）...")
+    mem_dst, _ = persist_rule_memory(rules_path, rule_count=len(rules))
     if mem_dst:
         print(f"      当前生效规则副本: {mem_dst}")
-        print(f"      记忆记录文件:     {os.path.join(data_dir, MEMORY_META_FILENAME)}")
+        print(f"      记忆记录文件:     {os.path.join(get_memory_dir(), MEMORY_META_FILENAME)}")
     else:
-        print("      数据源目录不可写或写入失败，本次不更新规则记忆")
+        print("      软件规则记忆目录不可写或写入失败，本次不更新规则记忆")
 
     print("[2/6] 读取并提取数据源字段（内容同类识别） ...")
     src_paths = resolve_source_paths(data_dir, source_files)
@@ -834,13 +853,13 @@ def main():
     if not os.path.isdir(data_dir):
         sys.exit(f"数据源目录不存在: {data_dir}")
 
-    rules_path, auto_loaded, _ = resolve_rules_path(data_dir, args.rules)
+    rules_path, auto_loaded, _ = resolve_rules_path(args.rules)
     if rules_path is None:
         sys.exit(
-            "未找到重分类规则文件。\n"
-            "  请通过 --rules 指定规则文件，或先将规则保存为:\n"
-            f"    {os.path.join(data_dir, '重分类规则.xlsx')}\n"
-            "  也可先运行 --export-template 导出规则模板填写规则。"
+            "未找到可用的重分类规则。\n"
+            "  软件自身尚未记忆规则：请先通过 --rules 导入规则文件，\n"
+            "  或运行 --export-template 导出规则模板填写规则后再导入。\n"
+            f"  规则固化目录: {get_memory_dir()}\n"
         )
     if auto_loaded:
         print(f"[记忆] 自动加载当前生效规则: {rules_path}")
